@@ -48,6 +48,7 @@ st.markdown("""
 with st.sidebar:
     st.header("Settings")
 
+    # Always read fresh from secrets — never cache in session_state
     default_key = ""
     try:
         default_key = st.secrets.get("GEMINI_API_KEY", "")
@@ -61,6 +62,22 @@ with st.sidebar:
         help="Free key from aistudio.google.com/apikey",
         placeholder="Your Gemini API key",
     )
+
+    # Show last 6 chars of active key so user can verify which key is loaded
+    if api_key:
+        st.caption(f"Active key: ...{api_key[-6:]}")
+        if st.button("Verify Key", use_container_width=True):
+            import requests
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}",
+                json={"contents": [{"parts": [{"text": "hi"}]}]},
+            )
+            if resp.status_code == 200:
+                st.success("Key is valid!")
+            elif resp.status_code == 503:
+                st.warning("Key valid but Gemini is busy — try again in a moment.")
+            else:
+                st.error(f"Key invalid ({resp.status_code}): {resp.json().get('error',{}).get('message','')}")
 
     st.subheader("Meeting Info (optional)")
     meeting_title = st.text_input("Meeting Title", placeholder="e.g. Q4 Planning Session")
