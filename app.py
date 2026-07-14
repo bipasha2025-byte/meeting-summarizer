@@ -2,13 +2,13 @@ import streamlit as st
 import tempfile
 import json
 import os
+import base64
 from pathlib import Path
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
-import google.generativeai as genai
-import time
+from groq import Groq
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -40,7 +40,7 @@ st.markdown("""
 st.markdown("""
 <div class="main-header">
   <h1>Meeting Summarizer</h1>
-  <p>Upload a meeting video &rarr; Gemini transcribes &amp; analyses &rarr; Download PowerPoint</p>
+  <p>Upload a meeting video &rarr; AI transcribes &amp; analyses &rarr; Download PowerPoint</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -48,36 +48,25 @@ st.markdown("""
 with st.sidebar:
     st.header("Settings")
 
-    # Always read fresh from secrets — never cache in session_state
     default_key = ""
     try:
-        default_key = st.secrets.get("GEMINI_API_KEY", "")
+        default_key = st.secrets.get("GROQ_API_KEY", "")
     except Exception:
         pass
 
     api_key = st.text_input(
-        "Gemini API Key",
+        "Groq API Key",
         value=default_key,
         type="password",
-        help="Free key from aistudio.google.com/apikey",
-        placeholder="Your Gemini API key",
+        help="Free key from console.groq.com — starts with gsk_",
+        placeholder="gsk_...",
     )
 
-    # Show last 6 chars of active key so user can verify which key is loaded
     if api_key:
-        st.caption(f"Active key: ...{api_key[-6:]}")
-        if st.button("Verify Key", use_container_width=True):
-            import requests
-            resp = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}",
-                json={"contents": [{"parts": [{"text": "hi"}]}]},
-            )
-            if resp.status_code == 200:
-                st.success("Key is valid!")
-            elif resp.status_code == 503:
-                st.warning("Key valid but Gemini is busy — try again in a moment.")
-            else:
-                st.error(f"Key invalid ({resp.status_code}): {resp.json().get('error',{}).get('message','')}")
+        if api_key.startswith("gsk_"):
+            st.success("Key format looks correct (gsk_...)")
+        else:
+            st.error("Invalid key format. Groq keys must start with gsk_  — get yours free at console.groq.com")
 
     st.subheader("Meeting Info (optional)")
     meeting_title = st.text_input("Meeting Title", placeholder="e.g. Q4 Planning Session")
@@ -85,77 +74,69 @@ with st.sidebar:
 
     st.divider()
     st.caption("Built for IBM WatsonX Challenge")
-    st.caption("Powered by Google Gemini Flash + python-pptx")
-    st.caption("No FFmpeg or Whisper needed — runs entirely in the cloud")
+    st.caption("Powered by Groq (Llama 3.3 70B) + Whisper + python-pptx")
+    st.caption("Free — no credit card needed")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def transcribe_and_summarize(video_path, video_mime, title, date, key, progress):
-    """Upload video to Gemini Files API, then transcribe + summarise in one call."""
+def transcribe_video(video_path, key, progress):
+    """Transcribe video audio using Groq's Whisper API (free, cloud-based)."""
+    progress.progress(20, "Transcribing audio with Groq Whisper...")
 
-    genai.configure(api_key=key)
+    client = Groq(api_key=key)
 
-    # Step 1: Upload the video file to Gemini Files API
-    progress.progress(15, "Uploading video to Gemini (this may take a moment for large files)...")
-    video_file = genai.upload_file(path=video_path, mime_type=video_mime)
+    with open(video_path, "rb") as f:
+        transcription = client.audio.transcriptions.create(
+            file=(Path(video_path).name, f),
+            model="whisper-large-v3-turbo",
+            response_format="text",
+        )
 
-    # Step 2: Wait for Gemini to finish processing the file
-    progress.progress(30, "Gemini is processing the video...")
-    max_wait = 300  # 5 minutes max
-    waited   = 0
-    while video_file.state.name == "PROCESSING":
-        if waited >= max_wait:
-            raise TimeoutError("Gemini took too long to process the video. Try a shorter clip.")
-        time.sleep(5)
-        waited += 5
-        video_file = genai.get_file(video_file.name)
+    progress.progress(50, "Transcription complete.")
+    return transcription
 
-    if video_file.state.name == "FAILED":
-        raise ValueError("Gemini failed to process the video file. Check the file is a valid video.")
 
-    # Step 3: Send the processed video to Gemini with a combined transcribe + summarise prompt
-    progress.progress(55, "Gemini is transcribing and extracting key points...")
+def summarize_with_groq(transcript, title, date, key, progress):
+    """Extract key points from transcript using Groq Llama 3.3 70B."""
+    progress.progress(55, "Analysing transcript with Llama 3.3 70B...")
 
-    model = genai.GenerativeModel(
-        model_name="gemini-flash-latest",
-        generation_config={"response_mime_type": "application/json", "temperature": 0.2},
-    )
+    client = Groq(api_key=key)
 
-    prompt = f"""You are an expert meeting analyst.
-Watch and listen to this meeting video carefully.
-First transcribe what is said, then extract the most important information.
-Return ONLY valid JSON — no markdown fences, no extra text:
-{{
+    system_prompt = """You are an expert meeting analyst.
+Extract the most important information from meeting transcripts.
+Return ONLY valid JSON — no markdown fences, no extra text, just the raw JSON object.
+
+Use this EXACT structure:
+{
   "title": "meeting title",
   "date": "meeting date",
-  "transcript": "full transcript of the meeting speech",
   "executive_summary": "2-3 sentence high-level summary",
   "key_points": ["key discussion point 1", "key discussion point 2"],
   "decisions": ["decision agreed upon 1"],
   "action_items": [
-    {{"task": "what needs to be done", "owner": "person or TBD", "due": "date or TBD"}}
+    {"task": "what needs to be done", "owner": "person or TBD", "due": "date or TBD"}
   ],
   "next_steps": ["follow-up item 1"],
   "attendees": ["Name 1", "Name 2"]
-}}
+}
 
 Rules:
 - key_points must cover ALL major topics discussed
 - decisions = only things explicitly agreed upon
 - Extract action items even if implied; use TBD for unknown owners/dates
+- Be concise but complete"""
 
-Meeting Title: {title or "Untitled Meeting"}
-Meeting Date:  {date  or "Unknown"}"""
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Meeting Title: {title or 'Untitled Meeting'}\nMeeting Date: {date or 'Unknown'}\n\nTranscript:\n{transcript}"},
+        ],
+        temperature=0.2,
+        response_format={"type": "json_object"},
+    )
 
-    result  = model.generate_content([video_file, prompt])
-    summary = json.loads(result.text)
-
-    # Clean up uploaded file from Gemini storage
-    try:
-        genai.delete_file(video_file.name)
-    except Exception:
-        pass
-
+    summary = json.loads(response.choices[0].message.content)
     progress.progress(80, "Analysis complete.")
     return summary
 
@@ -196,7 +177,6 @@ def add_content_slide(prs, title, items, accent):
     slide.background.fill.solid()
     slide.background.fill.fore_color.rgb = hex_rgb("ffffff")
 
-    # Heading
     txb = slide.shapes.add_textbox(Inches(0.5), Inches(0.35), Inches(12.3), Inches(0.65))
     p   = txb.text_frame.paragraphs[0]
     run = p.add_run()
@@ -205,13 +185,11 @@ def add_content_slide(prs, title, items, accent):
     run.font.bold  = True
     run.font.color.rgb = hex_rgb(accent)
 
-    # Accent line
     ln = slide.shapes.add_shape(1, Inches(0.5), Inches(1.1), Inches(12.3), Emu(12700))
     ln.fill.background()
     ln.line.color.rgb = hex_rgb(accent)
     ln.line.width = Emu(25400)
 
-    # Body bullets
     txb2 = slide.shapes.add_textbox(Inches(0.5), Inches(1.3), Inches(12.3), Inches(5.5))
     tf2  = txb2.text_frame
     tf2.word_wrap = True
@@ -271,51 +249,48 @@ with col1:
     st.subheader("1  Upload Meeting Video")
     uploaded = st.file_uploader(
         "Drop your video here",
-        type=["mp4", "mov", "mkv", "avi", "webm"],
+        type=["mp4", "mov", "mkv", "avi", "webm", "m4a", "mp3", "wav"],
         help="Zoom, Teams, Meet, or any screen recording",
     )
     if uploaded:
-        st.video(uploaded)
+        if uploaded.type.startswith("video"):
+            st.video(uploaded)
         st.caption(f"{uploaded.name}  ({uploaded.size / 1024 / 1024:.1f} MB)")
 
 with col2:
     st.subheader("2  Generate Summary + PPT")
 
     if not api_key:
-        st.info("Enter your Gemini API key in the sidebar to get started.")
+        st.info("Enter your Groq API key in the sidebar. Get one free at console.groq.com — starts with gsk_")
+    elif not api_key.startswith("gsk_"):
+        st.error("Your key must start with gsk_  — go to console.groq.com → API Keys → Create API Key")
     elif not uploaded:
         st.info("Upload a meeting video on the left to begin.")
     else:
         if st.button("Generate Summary + PPT", type="primary", use_container_width=True):
             progress = st.progress(0, "Starting...")
             try:
-                # Save uploaded file to a temp path on disk
-                suffix   = Path(uploaded.name).suffix.lower()
-                mime_map = {
-                    ".mp4": "video/mp4", ".mov": "video/quicktime",
-                    ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
-                    ".webm": "video/webm",
-                }
-                video_mime = mime_map.get(suffix, "video/mp4")
-
                 progress.progress(5, "Saving uploaded file...")
+                suffix    = Path(uploaded.name).suffix.lower() or ".mp4"
                 tmp_video = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
                 tmp_video.write(uploaded.getbuffer())
                 tmp_video.close()
 
-                # Transcribe + summarise in one Gemini call
-                summary = transcribe_and_summarize(
-                    tmp_video.name,
-                    video_mime,
+                # Step 1: Transcribe with Groq Whisper
+                transcript = transcribe_video(tmp_video.name, api_key, progress)
+                st.session_state["transcript"] = transcript
+
+                # Step 2: Summarise with Llama 3.3
+                summary = summarize_with_groq(
+                    transcript,
                     meeting_title or uploaded.name,
                     meeting_date or "",
                     api_key,
                     progress,
                 )
-                st.session_state["transcript"] = summary.get("transcript", "")
-                st.session_state["summary"]    = summary
+                st.session_state["summary"] = summary
 
-                # Build PPT
+                # Step 3: Build PPT
                 ppt_bytes = generate_ppt(summary, progress)
                 st.session_state["ppt_bytes"] = ppt_bytes
                 os.unlink(tmp_video.name)
