@@ -82,21 +82,41 @@ with st.sidebar:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+def find_ffmpeg():
+    """Find ffmpeg binary — checks PATH and common Windows install locations."""
+    import shutil, sys
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    # Common Windows locations (winget, choco, manual extract)
+    candidates = [
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+        r"C:\ProgramData\winget\packages\Gyan.FFmpeg_8.1.2\ffmpeg-8.1.2-full_build\bin\ffmpeg.exe",
+    ]
+    # Also scan every directory on PATH explicitly
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        exe = os.path.join(p, "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg")
+        candidates.append(exe)
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
 def check_ffmpeg():
-    try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-        return True
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
+    return find_ffmpeg() is not None
 
 
 def transcribe_video(video_path, model, progress):
     progress.progress(10, "Extracting audio from video...")
     tmp_dir    = tempfile.mkdtemp()
     audio_path = os.path.join(tmp_dir, "audio.wav")
+    ffmpeg_bin = find_ffmpeg() or "ffmpeg"
 
     subprocess.run(
-        ["ffmpeg", "-y", "-i", video_path,
+        [ffmpeg_bin, "-y", "-i", video_path,
          "-ar", "16000", "-ac", "1", "-f", "wav", audio_path],
         capture_output=True, check=True
     )
