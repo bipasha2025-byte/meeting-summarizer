@@ -1,15 +1,14 @@
 import streamlit as st
-import subprocess
 import tempfile
 import json
 import os
-import shutil
 from pathlib import Path
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 import google.generativeai as genai
+import time
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -41,7 +40,7 @@ st.markdown("""
 st.markdown("""
 <div class="main-header">
   <h1>Meeting Summarizer</h1>
-  <p>Upload a meeting video &rarr; Auto-transcribe &rarr; Extract key points &rarr; Download PowerPoint</p>
+  <p>Upload a meeting video &rarr; Gemini transcribes &amp; analyses &rarr; Download PowerPoint</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -63,112 +62,84 @@ with st.sidebar:
         placeholder="Your Gemini API key",
     )
 
-    st.divider()
-    st.subheader("Transcription")
-    whisper_model = st.selectbox(
-        "Whisper Model",
-        ["tiny", "base", "small", "medium"],
-        index=1,
-        help="Larger = more accurate but slower.",
-    )
-
     st.subheader("Meeting Info (optional)")
     meeting_title = st.text_input("Meeting Title", placeholder="e.g. Q4 Planning Session")
     meeting_date  = st.text_input("Meeting Date",  placeholder="e.g. 15 Jan 2025")
 
     st.divider()
     st.caption("Built for IBM WatsonX Challenge")
-    st.caption("Whisper + Gemini Flash + python-pptx")
+    st.caption("Powered by Google Gemini Flash + python-pptx")
+    st.caption("No FFmpeg or Whisper needed — runs entirely in the cloud")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def find_ffmpeg():
-    """Find ffmpeg binary — checks PATH and common Windows install locations."""
-    import shutil, sys
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
-    # Common Windows locations (winget, choco, manual extract)
-    candidates = [
-        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
-        r"C:\ffmpeg\bin\ffmpeg.exe",
-        r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
-        r"C:\ProgramData\winget\packages\Gyan.FFmpeg_8.1.2\ffmpeg-8.1.2-full_build\bin\ffmpeg.exe",
-    ]
-    # Also scan every directory on PATH explicitly
-    for p in os.environ.get("PATH", "").split(os.pathsep):
-        exe = os.path.join(p, "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg")
-        candidates.append(exe)
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return None
-
-
-def check_ffmpeg():
-    return find_ffmpeg() is not None
-
-
-def transcribe_video(video_path, model, progress):
-    progress.progress(10, "Extracting audio from video...")
-    tmp_dir    = tempfile.mkdtemp()
-    audio_path = os.path.join(tmp_dir, "audio.wav")
-    ffmpeg_bin = find_ffmpeg() or "ffmpeg"
-
-    subprocess.run(
-        [ffmpeg_bin, "-y", "-i", video_path,
-         "-ar", "16000", "-ac", "1", "-f", "wav", audio_path],
-        capture_output=True, check=True
-    )
-
-    progress.progress(30, f"Transcribing with Whisper ({model}) — this may take a few minutes...")
-    subprocess.run(
-        ["whisper", audio_path,
-         "--output_format", "txt", "--output_dir", tmp_dir, "--model", model],
-        capture_output=True, check=True
-    )
-
-    transcript_path = os.path.join(tmp_dir, "audio.txt")
-    if not os.path.exists(transcript_path):
-        raise FileNotFoundError("Whisper did not produce a transcript. Check the video has clear audio.")
-
-    transcript = Path(transcript_path).read_text(encoding="utf-8")
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    return transcript
-
-
-def summarize_with_gemini(transcript, title, date, key, progress):
-    progress.progress(60, "Sending transcript to Gemini Flash for analysis...")
+def transcribe_and_summarize(video_path, video_mime, title, date, key, progress):
+    """Upload video to Gemini Files API, then transcribe + summarise in one call."""
 
     genai.configure(api_key=key)
+
+    # Step 1: Upload the video file to Gemini Files API
+    progress.progress(15, "Uploading video to Gemini (this may take a moment for large files)...")
+    video_file = genai.upload_file(path=video_path, mime_type=video_mime)
+
+    # Step 2: Wait for Gemini to finish processing the file
+    progress.progress(30, "Gemini is processing the video...")
+    max_wait = 300  # 5 minutes max
+    waited   = 0
+    while video_file.state.name == "PROCESSING":
+        if waited >= max_wait:
+            raise TimeoutError("Gemini took too long to process the video. Try a shorter clip.")
+        time.sleep(5)
+        waited += 5
+        video_file = genai.get_file(video_file.name)
+
+    if video_file.state.name == "FAILED":
+        raise ValueError("Gemini failed to process the video file. Check the file is a valid video.")
+
+    # Step 3: Send the processed video to Gemini with a combined transcribe + summarise prompt
+    progress.progress(55, "Gemini is transcribing and extracting key points...")
+
     model = genai.GenerativeModel(
         model_name="gemini-flash-latest",
         generation_config={"response_mime_type": "application/json", "temperature": 0.2},
     )
 
     prompt = f"""You are an expert meeting analyst.
-Extract the most important information from the transcript below.
-Return ONLY valid JSON with this EXACT structure — no markdown, no extra text:
+Watch and listen to this meeting video carefully.
+First transcribe what is said, then extract the most important information.
+Return ONLY valid JSON — no markdown fences, no extra text:
 {{
   "title": "meeting title",
   "date": "meeting date",
-  "executive_summary": "2-3 sentence summary",
-  "key_points": ["point 1", "point 2"],
-  "decisions": ["decision 1"],
-  "action_items": [{{"task": "task", "owner": "person or TBD", "due": "date or TBD"}}],
-  "next_steps": ["step 1"],
-  "attendees": ["Name 1"]
+  "transcript": "full transcript of the meeting speech",
+  "executive_summary": "2-3 sentence high-level summary",
+  "key_points": ["key discussion point 1", "key discussion point 2"],
+  "decisions": ["decision agreed upon 1"],
+  "action_items": [
+    {{"task": "what needs to be done", "owner": "person or TBD", "due": "date or TBD"}}
+  ],
+  "next_steps": ["follow-up item 1"],
+  "attendees": ["Name 1", "Name 2"]
 }}
 
+Rules:
+- key_points must cover ALL major topics discussed
+- decisions = only things explicitly agreed upon
+- Extract action items even if implied; use TBD for unknown owners/dates
+
 Meeting Title: {title or "Untitled Meeting"}
-Meeting Date:  {date or "Unknown"}
+Meeting Date:  {date  or "Unknown"}"""
 
-Transcript:
-{transcript}"""
-
-    result  = model.generate_content(prompt)
+    result  = model.generate_content([video_file, prompt])
     summary = json.loads(result.text)
-    progress.progress(80, "Summary extracted.")
+
+    # Clean up uploaded file from Gemini storage
+    try:
+        genai.delete_file(video_file.name)
+    except Exception:
+        pass
+
+    progress.progress(80, "Analysis complete.")
     return summary
 
 
@@ -208,7 +179,7 @@ def add_content_slide(prs, title, items, accent):
     slide.background.fill.solid()
     slide.background.fill.fore_color.rgb = hex_rgb("ffffff")
 
-    # Title
+    # Heading
     txb = slide.shapes.add_textbox(Inches(0.5), Inches(0.35), Inches(12.3), Inches(0.65))
     p   = txb.text_frame.paragraphs[0]
     run = p.add_run()
@@ -223,7 +194,7 @@ def add_content_slide(prs, title, items, accent):
     ln.line.color.rgb = hex_rgb(accent)
     ln.line.width = Emu(25400)
 
-    # Body
+    # Body bullets
     txb2 = slide.shapes.add_textbox(Inches(0.5), Inches(1.3), Inches(12.3), Inches(5.5))
     tf2  = txb2.text_frame
     tf2.word_wrap = True
@@ -232,7 +203,11 @@ def add_content_slide(prs, title, items, accent):
         para.space_after = Pt(6)
         run2 = para.add_run()
         if isinstance(item, dict):
-            run2.text = f"  {item.get('task','')}   |   Owner: {item.get('owner','TBD')}   |   Due: {item.get('due','TBD')}"
+            run2.text = (
+                f"  {item.get('task', '')}   |   "
+                f"Owner: {item.get('owner', 'TBD')}   |   "
+                f"Due: {item.get('due', 'TBD')}"
+            )
         else:
             run2.text = f"  {item}"
         run2.font.size  = Pt(14)
@@ -286,9 +261,6 @@ with col1:
         st.video(uploaded)
         st.caption(f"{uploaded.name}  ({uploaded.size / 1024 / 1024:.1f} MB)")
 
-    if not check_ffmpeg():
-        st.warning("FFmpeg not found. Install: `winget install ffmpeg` then restart terminal.")
-
 with col2:
     st.subheader("2  Generate Summary + PPT")
 
@@ -300,32 +272,37 @@ with col2:
         if st.button("Generate Summary + PPT", type="primary", use_container_width=True):
             progress = st.progress(0, "Starting...")
             try:
-                tmp_video = tempfile.NamedTemporaryFile(
-                    delete=False, suffix=Path(uploaded.name).suffix
-                )
+                # Save uploaded file to a temp path on disk
+                suffix   = Path(uploaded.name).suffix.lower()
+                mime_map = {
+                    ".mp4": "video/mp4", ".mov": "video/quicktime",
+                    ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
+                    ".webm": "video/webm",
+                }
+                video_mime = mime_map.get(suffix, "video/mp4")
+
+                progress.progress(5, "Saving uploaded file...")
+                tmp_video = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
                 tmp_video.write(uploaded.getbuffer())
                 tmp_video.close()
 
-                transcript = transcribe_video(tmp_video.name, whisper_model, progress)
-                st.session_state["transcript"] = transcript
-
-                summary = summarize_with_gemini(
-                    transcript,
+                # Transcribe + summarise in one Gemini call
+                summary = transcribe_and_summarize(
+                    tmp_video.name,
+                    video_mime,
                     meeting_title or uploaded.name,
                     meeting_date or "",
                     api_key,
                     progress,
                 )
-                st.session_state["summary"] = summary
+                st.session_state["transcript"] = summary.get("transcript", "")
+                st.session_state["summary"]    = summary
 
+                # Build PPT
                 ppt_bytes = generate_ppt(summary, progress)
                 st.session_state["ppt_bytes"] = ppt_bytes
                 os.unlink(tmp_video.name)
 
-            except subprocess.CalledProcessError as e:
-                progress.empty()
-                st.error(f"Processing error: {e.stderr.decode() if e.stderr else str(e)}")
-                st.stop()
             except Exception as e:
                 progress.empty()
                 st.error(f"Error: {e}")
@@ -346,7 +323,7 @@ with col2:
                 type="primary",
             )
 
-            if "transcript" in st.session_state:
+            if st.session_state.get("transcript"):
                 with st.expander("View Transcript"):
                     st.text_area(
                         "Transcript",
@@ -362,21 +339,23 @@ if "summary" in st.session_state:
     st.subheader("Slide Preview")
 
     slides = [
-        ("Slide 1 — Title",            [s.get("title",""), s.get("date","")]),
-        ("Slide 2 — Executive Summary", [s.get("executive_summary","")]),
-        ("Slide 3 — Key Points",        s.get("key_points",[])),
-        ("Slide 4 — Decisions Made",    s.get("decisions",[])),
+        ("Slide 1 — Title",            [s.get("title", ""), s.get("date", "")]),
+        ("Slide 2 — Executive Summary", [s.get("executive_summary", "")]),
+        ("Slide 3 — Key Points",        s.get("key_points", [])),
+        ("Slide 4 — Decisions Made",    s.get("decisions", [])),
         ("Slide 5 — Action Items",
          [f"{a.get('task','')} | {a.get('owner','TBD')} | {a.get('due','TBD')}"
-          for a in s.get("action_items",[])]),
-        ("Slide 6 — Next Steps",        s.get("next_steps",[])),
+          for a in s.get("action_items", [])]),
+        ("Slide 6 — Next Steps",        s.get("next_steps", [])),
     ]
 
     cols = st.columns(3)
     for i, (slide_title, items) in enumerate(slides):
         with cols[i % 3]:
-            content = "".join(f"<div style='font-size:12px;margin:2px 0'>• {it}</div>"
-                               for it in items if it)
+            content = "".join(
+                f"<div style='font-size:12px;margin:2px 0'>• {it}</div>"
+                for it in items if it
+            )
             st.markdown(
                 f'<div class="slide-preview">'
                 f'<div class="slide-title">{slide_title}</div>{content}</div>',
