@@ -1,4 +1,5 @@
 import streamlit as st
+import subprocess
 import tempfile
 import json
 import os
@@ -79,21 +80,86 @@ with st.sidebar:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def transcribe_video(video_path, key, progress):
-    """Transcribe video audio using Groq's Whisper API (free, cloud-based)."""
-    progress.progress(20, "Transcribing audio with Groq Whisper...")
+GROQ_MAX_BYTES = 24 * 1024 * 1024
+CHUNK_SECONDS  = 15 * 60
 
-    client = Groq(api_key=key)
 
-    with open(video_path, "rb") as f:
-        transcription = client.audio.transcriptions.create(
-            file=(Path(video_path).name, f),
+def _run_ffmpeg(cmd):
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "ffmpeg is not installed on this server. If you're on Streamlit "
+            "Community Cloud, add a line containing just 'ffmpeg' to "
+            "packages.txt and redeploy."
+        )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {result.stderr[-800:]}")
+    return result
+
+
+def extract_compressed_audio(video_path, progress):
+    progress.progress(10, "Extracting and compressing audio...")
+    audio_path = f"{video_path}_audio.mp3"
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
+        audio_path,
+    ]
+    _run_ffmpeg(cmd)
+    return audio_path
+
+
+def split_audio_into_chunks(audio_path, chunk_seconds=CHUNK_SECONDS):
+    base    = audio_path.rsplit(".", 1)[0]
+    pattern = f"{base}_chunk_%03d.mp3"
+    cmd = [
+        "ffmpeg", "-y", "-i", audio_path,
+        "-f", "segment", "-segment_time", str(chunk_seconds),
+        "-c", "copy", pattern,
+    ]
+    _run_ffmpeg(cmd)
+    glob_pattern = Path(pattern).name.replace("%03d", "*")
+    chunk_files  = sorted(Path(audio_path).parent.glob(glob_pattern))
+    return [str(p) for p in chunk_files]
+
+
+def _transcribe_file(client, path):
+    with open(path, "rb") as f:
+        return client.audio.transcriptions.create(
+            file=(Path(path).name, f),
             model="whisper-large-v3-turbo",
             response_format="text",
         )
 
-    progress.progress(50, "Transcription complete.")
-    return transcription
+
+def transcribe_video(video_path, key, progress):
+    client     = Groq(api_key=key)
+    audio_path = extract_compressed_audio(video_path, progress)
+    audio_size = os.path.getsize(audio_path)
+
+    try:
+        if audio_size <= GROQ_MAX_BYTES:
+            progress.progress(30, "Transcribing audio with Groq Whisper...")
+            transcription = _transcribe_file(client, audio_path)
+            progress.progress(50, "Transcription complete.")
+            return transcription
+
+        progress.progress(25, "Audio still large — splitting into chunks...")
+        chunk_paths = split_audio_into_chunks(audio_path)
+        texts = []
+        n = len(chunk_paths)
+        for i, chunk_path in enumerate(chunk_paths):
+            pct = 30 + int((i / max(n, 1)) * 20)
+            progress.progress(pct, f"Transcribing chunk {i + 1}/{n}...")
+            texts.append(_transcribe_file(client, chunk_path))
+            os.unlink(chunk_path)
+
+        progress.progress(50, "Transcription complete.")
+        return " ".join(texts)
+    finally:
+        if os.path.exists(audio_path):
+            os.unlink(audio_path)
 
 
 def summarize_with_groq(transcript, title, date, key, progress):
